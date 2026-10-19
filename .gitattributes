@@ -1,0 +1,4 @@
+# 换行策略：Windows 启动脚本与配置必须是 CRLF。
+# cmd 的 for /f 只认 CRLF，.env 用 LF 存会导致整份配置读不进来（ADR-13/14）。
+*.bat text eol=crlf
+.env  text eol=crlf
