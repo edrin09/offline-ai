@@ -21,6 +21,8 @@ for /f "usebackq eol=# tokens=1,* delims==" %%a in ("%ENV_FILE%") do if not "%%~
 
 :: Full paths derived from .env
 set "SERVER=%SERVER_DIR%\%SERVER_EXE%"
+set "REA_FLAG="
+if defined REASONING set "REA_FLAG=-rea %REASONING%"
 
 :: Config check: fail loudly if a key file is missing, instead of
 :: opening a window that flashes by.
@@ -32,7 +34,9 @@ echo ============================================
 echo   Model Switcher - ik_llama.cpp  (port %PORT%)
 echo ============================================
 echo   [1] Coder  - %MODEL_CODER%   (coding / agent / tool-calling, NO vision)
-echo   [2] Office - %MODEL_OFFICE%   (+ %MMPROJ_OFFICE%, WITH vision)
+set "VIS_NOTE="
+if defined MMPROJ_OFFICE set "VIS_NOTE=+ vision mmproj"
+echo   [2] Office - %MODEL_OFFICE%   (%VIS_NOTE%)
 echo ============================================
 choice /c 12 /n /m "Select model [1/2]: "
 if errorlevel 2 goto office
@@ -41,18 +45,19 @@ if errorlevel 1 goto coder
 :coder
 call :require "%MODELS_DIR%\%MODEL_CODER%" MODEL_CODER || goto cfgfail
 call :freeport || goto end
-start "ik-llama-coder" /D "%SERVER_DIR%" cmd /c "chcp 65001 >nul && "%PYTHON%" -u "%LOG_FILTER%" "%SERVER%" -m "%MODELS_DIR%\%MODEL_CODER%" --port %PORT% --host %HOST% --ctx-size %CTX_SIZE% --threads %THREADS% -b %BATCH% -ub %UBATCH% -fa %FLASH_ATTN% -ctk %CACHE_TYPE_K% -ctv %CACHE_TYPE_V% -cram %CRAM% --jinja --slot-save-path "%SLOTS_DIR%""
+start "ik-llama-coder" /D "%SERVER_DIR%" cmd /c "chcp 65001 >nul && "%PYTHON%" -u "%LOG_FILTER%" "%SERVER%" -m "%MODELS_DIR%\%MODEL_CODER%" --port %PORT% --host %HOST% --ctx-size %CTX_SIZE% --threads %THREADS% -b %BATCH% -ub %UBATCH% -fa %FLASH_ATTN% -ctk %CACHE_TYPE_K% -ctv %CACHE_TYPE_V% -cram %CRAM% --jinja %REA_FLAG% --slot-save-path "%SLOTS_DIR%""
 echo.
 echo [Coder] starting... API: http://%HOST%:%PORT%/v1/chat/completions
 goto end
 
 :office
 call :require "%MODELS_DIR%\%MODEL_OFFICE%" MODEL_OFFICE || goto cfgfail
-call :require "%MODELS_DIR%\%MMPROJ_OFFICE%" MMPROJ_OFFICE || goto cfgfail
+set "MM_FLAG="
+if defined MMPROJ_OFFICE if exist "%MODELS_DIR%\%MMPROJ_OFFICE%" set "MM_FLAG=--mmproj "%MODELS_DIR%\%MMPROJ_OFFICE%""
 call :freeport || goto end
-start "ik-llama-office" /D "%SERVER_DIR%" cmd /c "chcp 65001 >nul && "%PYTHON%" -u "%LOG_FILTER%" "%SERVER%" -m "%MODELS_DIR%\%MODEL_OFFICE%" --mmproj "%MODELS_DIR%\%MMPROJ_OFFICE%" --port %PORT% --host %HOST% --ctx-size %CTX_SIZE% --threads %THREADS% -b %BATCH% -ub %UBATCH% -fa %FLASH_ATTN% -ctk %CACHE_TYPE_K% -ctv %CACHE_TYPE_V% -cram %CRAM% --jinja --slot-save-path "%SLOTS_DIR%""
+start "ik-llama-office" /D "%SERVER_DIR%" cmd /c "chcp 65001 >nul && "%PYTHON%" -u "%LOG_FILTER%" "%SERVER%" -m "%MODELS_DIR%\%MODEL_OFFICE%" %MM_FLAG% --port %PORT% --host %HOST% --ctx-size %CTX_SIZE% --threads %THREADS% -b %BATCH% -ub %UBATCH% -fa %FLASH_ATTN% -ctk %CACHE_TYPE_K% -ctv %CACHE_TYPE_V% -cram %CRAM% --jinja %REA_FLAG% --slot-save-path "%SLOTS_DIR%""
 echo.
-echo [Office-VL] starting... API: http://%HOST%:%PORT%/v1/chat/completions
+echo [Office] starting... API: http://%HOST%:%PORT%/v1/chat/completions
 goto end
 
 :end
