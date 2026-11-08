@@ -1,6 +1,10 @@
 # 本地模型部署 — 记忆索引
 
-> 每轮常驻，控制在 1K token 内。细节按需 Read `README.md`。
+> 每轮常驻，控制在 1K token 内。细节按需 Read。
+
+> 文档分工（2026-11-08 起）：
+> - `README.md` —— 对外推广版（钩子 / 快速开始 / 九个坑 / 硬件换算），不含调试过程
+> - `docs/benchmarks.md` —— 内部定版汇总（完整实测数据 / 决策红线 / 3×3 复测方法），**结论以它为准**
 
 ## 硬约束
 
@@ -26,20 +30,20 @@
   - TG 30/27/23（3K/7.7K/12.2K），比 Coder 快 2.3~3.6x；PP 快 3.7x（12K 冷 prefill ~2 分钟）
   - 工具调用 PASS（--jinja）；**编程正确率仅 2/6 vs Coder 5/6**
   - ⚠️ 按 2 只用于读长文/问答/总结/改写；写代码、Agent 一律按 1 Coder
-  - 视觉能力已放弃（核显 offload 排除 + 无多模态模型），见 README.md「不要再试」
+  - 视觉能力已放弃（核显 offload 排除 + 无多模态模型），见 docs/benchmarks.md「不要再试」
 
 ## 路径（2026-10-19 重组）
 
-引擎 `main/ikllama/llama-server.exe` ｜ 模型 `main/models/` ｜ 缓存槽 `main/slots/` ｜ 日志美化 `main/log_filter.py` ｜ 服务日志 `logs/`（`llama-YYYY-MM-DD.log` 美化版按天滚动）｜ 文档 `README.md` ｜ 配置 `.env` ｜ 根目录只留 bat + .env + README
+引擎 `main/ikllama/llama-server.exe` ｜ 模型 `main/models/` ｜ 缓存槽 `main/slots/` ｜ 日志美化 `main/log_filter.py` ｜ 服务日志 `logs/`（`llama-YYYY-MM-DD.log` 美化版按天滚动）｜ 文档 `README.md`(对外) + `docs/benchmarks.md`(实测/红线) ｜ 配置 `.env` ｜ 根目录留 bat + .env + README + LICENSE
 
 ## 按需 Read
 
-`README.md` 定版汇总（实测数据 + 决策红线 + 换模型复测方法，2026-10-22 全部合一）
+`docs/benchmarks.md` 定版汇总（实测数据 + 决策红线 + 换模型复测方法，2026-10-22 全部合一）；`README.md` 是对外推广版，改文案不改结论
 
 ## 纪律
 
-1. 动 bat / 启动参数前先读 `README.md`
-2. 只有实测结论能写进本文件和 `README.md`；矛盾时以实测为准并同步更新
-3. 任务收尾或会话压缩时，新决策 / 新坑 write-back 到 `README.md`；
-4. `README.md` 只留当前生效的结论——调试/迭代过程（v2/v3 演进史、脚本复现步骤）不写入
+1. 动 bat / 启动参数前先读 `docs/benchmarks.md` 的「决策红线」
+2. 只有实测结论能写进本文件和文档；矛盾时以实测为准并同步更新（结论写 `docs/benchmarks.md`，用户看得懂的话再摘进 `README.md`）
+3. 任务收尾或会话压缩时，新决策 / 新坑 write-back 到 `docs/benchmarks.md`；
+4. 文档只留当前生效的结论——调试/迭代过程（v2/v3 演进史、脚本复现步骤）不写入
 5. 每轮请求：系统+工具 2~4K + 工作区 ≤ 8K；工具输出 > 2K token 只读头尾

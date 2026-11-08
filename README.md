@@ -1,229 +1,361 @@
-# 本地大模型推理部署（ik_llama.cpp）
+<div align="center">
 
-Ryzen 7 5800U / 32GB / 无独显 的纯 CPU 推理方案。引擎为 Thireus fork 的 ik_llama.cpp（znver2-avx2 构建），提供 OpenAI 兼容 API 供 OpenCode 等编辑器/Agent 接入。
+<img src="docs/screenshots/hero.jpg" alt="OfflineAI 终端截图" width="100%">
 
-> 2026-10-22 定版汇总（原 benchmarks / architecture / pitfalls / 3x3-test / hardware 五份 + 根 README 合并为本文）。只保留当前生效结论，测试过程与历史迭代不保留。
-> **现役模型**：Coder-30B-A3B Q4_K_M（按 1：写/改代码、补全、tool-calling、Agent）+ Ling-mini-2.0 Q4_K_M（按 2：读长文、问答、总结、改写）。
-> 所有数字均在现行 `.env` 配置下实机测得（3 轮取均值，热衰减 ±10%，对比看相对值）。
+# 没有独显的笔记本，跑起 30B 代码模型
+
+一台 Ryzen 7 5800U / 32GB 核显本上的纯 CPU 本地大模型工作台
+
+<sub>OpenAI 兼容接口 · 断网可用 · 零 API 费用 · 代码不出本机</sub>
+
+![platform](https://img.shields.io/badge/platform-Windows%2011-0078D4?style=flat-square)
+![gpu](https://img.shields.io/badge/GPU-不需要-2ea44f?style=flat-square)
+![api](https://img.shields.io/badge/API-OpenAI%20%E5%85%BC%E5%AE%B9-412991?style=flat-square)
+![speed](https://img.shields.io/badge/%E7%94%9F%E6%88%90-13.67%20tok%2Fs-2f6bff?style=flat-square)
+![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
+
+</div>
+
+> **一句话**：不是「云端 API 的穷人替代品」，而是**一台断网也能用的 30B 代码助手**，跑在一台三年前的无独显轻薄本上。
+
+---
+
+## 先看数字
+
+| 指标 | 实测值 | 说明 |
+|---|---|---|
+| 生成速度 | **13.67 tok/s** | 30B MoE（激活 3B），1.5K 上下文，纯 CPU |
+| 二次提问 prefill | **19s → 73ms** | prompt 缓存命中，省掉 99.6% 的重复计算 |
+| 实用上下文 | **12K token** | 再往上（15K）会触发内存页回收，速度直接崩 |
+| 模型落盘 / 内存占用 | **29GB / 18.5GB** | 32GB 内存可跑，但得关浏览器 |
+| 每月 API 费用 | **¥0** | 除了电费 |
+| 代码质量（6 题 pass@1） | **5/6** | Qwen3-Coder-30B，和云端小模型打平 |
+
+<!-- 说明：速度取 3 轮均值，热衰减 ±10%，对比看相对值。 -->
+
+---
+
+## 为什么值得折腾这一套
+
+**1. 代码不出本机。** 公司代码、没发布的稿子、带客户信息的日志——这些本来就不该粘进别人的网页输入框。这套跑在 `127.0.0.1` 上，网线拔了照样用。
+
+**2. 没有显卡，不等于不能跑大模型。** 大多数人卡在一个误解上：以为本地部署 30B 需要 4090。其实 MoE 模型每生成一个 token 只激活一小部分参数——30B 的模型实际只算 3B，这才是它能在 CPU 上跑起来的原因。
+
+**3. 免费的部分比想象中多。** 补全、改 bug、写单元测试、解释一段老代码，这些高频操作现在的云端 API 一次几毛钱，一个月下来就是几百块。本地跑，边际成本是 0。
+
+**4. 一次调好，长期可用。** 所有参数集中在一个 `.env` 里，双击一个 bat 就启动，启动一次模型常驻内存。不折腾的时候，它就是个本地服务。
+
+---
+
+## 它是怎么做到的
+
+三件事，缺一不可。
+
+### 一｜选 MoE，不选 dense
+
+同样的参数规模，dense 模型每生成一个 token 都要把**全部**权重从内存读一遍；MoE 只读被激活的那几个专家。
+
+- `Qwen3-Coder-30B-A3B`：总参数 30B，**每个 token 只激活 3B**
+- `Ling-mini-2.0`：总参数 16B，**每个 token 只激活 1.4B**
+
+在 CPU 上，速度瓶颈几乎完全等于内存带宽，所以「激活参数量」直接决定快慢。这是整件事成立的前提。
+
+### 二｜换引擎，换掉一半的等待
+
+用 [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)（`znver2-avx2` 构建，build 5481），实测对比官方 llama.cpp：
+
+| 指标 | 提升 |
+|---|---|
+| 冷启动 prefill（PP） | **3.4 倍** |
+| 4K 上下文生成（TG） | **2.1 倍** |
+| 短上下文生成 | +16% |
+
+官方版已弃用——同一台机器上它慢 2~3 倍，这不是调参能追回来的差距。
+
+### 三｜把缓存用尽
+
+CPU 跑大模型最贵的不是「生成」，是「读上下文」。12K 上下文冷启动要 8.4 分钟，人早就走了。
+
+所以做了两层缓存：
+
+- **prompt 缓存**：同一段上下文第二次提问，prefill 从 19 秒降到 **73 毫秒**
+- **KV 缓存槽**（`--slot-save-path`）：4K 上下文存盘 111ms / 205MB，重启后 restore **55ms**——服务重启后第一轮就是热的
+
+> ⚠️ 唯一的硬伤：prompt 缓存按 4096 token 分段复用，13K 上下文每轮仍要重算约 9K。所以 agent 多轮长对话会慢，**这是当前最大的痛点**，靠控制上下文长度缓解。
+
+---
+
+## 实测数据
+
+### 速度矩阵（TG tok/s，三档上下文 × 两个模型）
+
+| 上下文档位 | Coder-30B-A3B | Ling-mini-2.0 | 差距 |
+|---|---|---|---|
+| short ~1.5K | 13.67 | 29.7 ~ 33.8 | 2.3× |
+| mid ~8K | 7.51 | 26.3 ~ 27.0 | 3.5× |
+| full ~12K | 6.83 | 22.8 | 3.3× |
+| 3K→12K 衰减 | **-50%** | **-32%** | — |
+| 内存占用 | 18.5GB | 10.5GB | — |
+
+冷启动 prefill（12K）：Coder **8.4 分钟** → Ling-mini **约 2 分钟**（3.7×）。
+
+### 质量（temp=0，6 题自动判分）
+
+| | Coder-30B-A3B | Ling-mini-2.0 |
+|---|---|---|
+| 编程正确率 | **5/6** | 2/6 |
+| tool-calling 两轮闭环 | PASS | PASS |
+
+Ling-mini 的 4 个 FAIL 很有代表性：`+86` 前缀丢首位、正则方括号转义写成 `$$`、`nonlocal` 作用域错、数组合并只 append 不替换。**结论：Ling-mini 只配纯文本场景，写代码和 Agent 一律用 Coder。**
+
+---
+
+## 先说清楚它做不到什么
+
+诚实比宣传重要。这套方案有三个明确的边界：
+
+| 边界 | 表现 | 能忍吗 |
+|---|---|---|
+| **首轮 prefill 慢** | 12K 上下文冷启动 2~8 分钟 | 长文场景建议先热一次再用 |
+| **单次生成上限** | 约 600~1100 token（`n_predict` 调不上去） | 长代码任务要拆多轮 |
+| **不是聊天机器人体验** | 13 tok/s ≈ 比人说话快一点，比云端慢 | 适合「扔个任务等结果」，不适合闲聊 |
+| **无视觉 / 无联网** | 纯文本，知识截止取决于模型 | — |
+| **不适合并发** | 单实例串行处理 | 个人用够了，别当服务端 |
+
+如果你的需求是「秒回」或「多人同时用」，这套方案不合适——直接用云端 API。
+
+---
+
+## 快速开始
+
+### 0. 硬件门槛
+
+| 项 | 最低 | 本文实测机 |
+|---|---|---|
+| 内存 | 24GB（跑 16B MoE）/ 32GB（跑 30B MoE） | 32GB DDR4-3200 |
+| CPU | 8 核，支持 AVX2 | Ryzen 7 5800U 8C16T |
+| 显卡 | **不需要** | Vega 8 核显 496MB（等于没有） |
+| 硬盘 | 40GB 空闲 | 512GB NVMe |
+| 系统 | Windows 10/11 | Windows 11 |
+
+> 核显 offload **实测排除**：显存比模型小，没有带宽增益，只是多一层拷贝。
+
+### 1. 放代码
+
+```bat
+git clone https://github.com/edrin09/offline-ai.git C:\OfflineAI
+```
+
+路径可以换，但 `.env` 里的路径要跟着改（一共 6 个键）。
+
+### 2. 装引擎
+
+把 `ik_llama.cpp` 的 Windows x64 预编译包（按你的 CPU 微架构选 `znver2-avx2` / `znver3` / 通用 `avx2`）解压到：
+
+```
+C:\OfflineAI\main\ikllama\
+```
+
+确认 `main\ikllama\llama-server.exe` 存在即可。编译产物约 147MB。
+
+### 3. 下模型（约 29GB）
+
+| 用途 | 模型 | 去哪下 |
+|---|---|---|
+| 写代码 / Agent | `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` | HuggingFace 搜 `Qwen3-Coder-30B-A3B-Instruct-GGUF` |
+| 读长文 / 问答 | `Ling-mini-2.0-Q4_K_M.gguf` | ModelScope：[`inclusionAI/Ling-mini-2.0-GGUF`](https://modelscope.cn/models/inclusionAI/Ling-mini-2.0-GGUF)（国内 9MB/s，稳） |
+
+两个都放到 `C:\OfflineAI\main\models\`，**文件名必须和 `.env` 里的一致**。
+
+> 只跑一个也行：另一个的路径留在 `.env` 里，启动时只体检你按的那个。
+
+### 4. 改 `.env`（通常只需要两行）
+
+```ini
+# 你机器上的 Python 解释器绝对路径（用来跑日志美化器）
+PYTHON=C:\uv\py3.14.8\Scripts\python.exe
+
+# 如果没装在 C:\OfflineAI，把这 4 个路径改成你的实际位置
+SERVER_DIR=C:\OfflineAI\main\ikllama
+MODELS_DIR=C:\OfflineAI\main\models
+SLOTS_DIR=C:\OfflineAI\main\slots
+LOGS_DIR=C:\OfflineAI\logs
+```
+
+> ⚠️ `.env` **必须存成 Windows CRLF 换行**。cmd 的 `for /f` 只认 CRLF，存成 LF 会导致整份配置读不进来（`.gitattributes` 已经帮你钉住了）。
+
+### 5. 启动
+
+双击 `switch-model.bat`：
+
+```
+============================================
+  Model Switcher - ik_llama.cpp  (port 9527)
+============================================
+  [1] Coder  - Qwen3-Coder-30B-A3B...  (coding / agent / tool-calling)
+  [2] Office - Ling-mini-2.0...        (long text / QA)
+============================================
+Select model [1/2]:
+```
+
+按 **1** 或 **2**，等控制台出现绿色横幅：
+
+```
+[就绪] 模型加载完成，现在可以使用了!
+[就绪] 对接地址 (OpenAI 兼容): http://127.0.0.1:9527/v1/chat/completions
+[就绪] 模型状态页(浏览器打开): http://127.0.0.1:9527
+```
+
+首次加载要把 17.3GB 权重整个读进内存（NVMe 上是几十秒量级，机械盘会很难受），之后就常驻了，重启一次即可长期用。
+
+---
+
+## 接进你的编辑器
+
+服务是标准 OpenAI 接口，任何支持「自定义 Base URL」的客户端都能接：
+
+```bash
+curl http://127.0.0.1:9527/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local",
+    "messages": [{"role": "user", "content": "解释一下这段代码在做什么"}],
+    "stream": true
+  }'
+```
+
+客户端里填这三个：
+
+| 填什么 | 值 |
+|---|---|
+| Base URL / API Base | `http://127.0.0.1:9527/v1` |
+| API Key | 随便填（不校验，`sk-no-key` 即可） |
+| Model | 随便填（服务端只有当前加载的那一个） |
+
+长期用 OpenCode 对接；任何支持自定义 Base URL 的客户端（Continue、Cline、自己写的 `openai` 脚本）配置方式相同。
+
+**Agent / tool-calling 能用**，因为启动参数里带了 `--jinja`——这个参数**不能省**，缺了带 `tools` 的请求直接返回 500。
+
+---
+
+## 两个模型怎么选
+
+| 你要做什么 | 按哪个 | 为什么 |
+|---|---|---|
+| 写代码、改代码、补全、Agent、tool-calling | **1 / Coder** | 编程正确率 5/6 vs 2/6，无思考税 |
+| 读长文档、问答、总结、改写、翻译 | **2 / Ling-mini** | 快 2.3~3.6 倍，占用内存少 8GB |
+
+**选型只看两件事：任务类型 + 上下文长度。** 任务难度（简单/中等/复杂）对速度没有实质影响（±5% 噪声内）。
+
+- 上下文预计 > 4K 的纯文本任务 → 优先 Ling-mini
+- 估 token：办公类 ≈ 字符数 ÷ 1.9，Coder 类 ≈ 字符数 ÷ 4
+
+---
+
+## 调参：只改 `.env`，不改代码
+
+`switch-model.bat` 和 `main/log_filter.py` 读的是同一份 `.env`。改参数只改这一个文件。
+
+| 想改什么 | 改哪个键 |
+|---|---|
+| 端口 / 监听地址 | `PORT` `HOST` |
+| 装到别的盘 | `SERVER_DIR` `MODELS_DIR` `SLOTS_DIR` `LOGS_DIR` |
+| 换模型 | `MODEL_CODER` `MODEL_OFFICE`（只写文件名） |
+| 上下文 / 线程 / batch / KV 量化 | `CTX_SIZE` `THREADS` `BATCH` `UBATCH` `CACHE_TYPE_K` `CACHE_TYPE_V` |
+| 思考税开关 | `REASONING`（默认 `off`） |
+
+配错不会静默失败：启动前会逐个体检 Python、引擎、美化器、所选模型文件，缺哪个直接报 `[error]` 并停住等按键。
+
+**现行最优参数**（实测过 5 组组合，这组最好）：
+
+```
+--ctx-size 16384 -ctk q8_0 -ctv q8_0 -cram 2048 --jinja --slot-save-path ...\main\slots
+线程数 8（写 12 是负优化，超线程帮不上忙）
+```
+
+---
+
+## 九个坑，都踩过
+
+写进文档的都是实测结论，不是猜的。
+
+1. **`--jinja` 不能省** —— 缺了带 `tools` 的请求直接 HTTP 500
+2. **上下文守 12K** —— 15K 触发内存页回收，速度从 14 掉到 1~3 tok/s 并卡死
+3. **内存总占用 ≤ 26GB** —— 超了会 swap，跑模型前关浏览器
+4. **官方 llama.cpp 要换掉** —— 慢 2~3 倍，换引擎是收益最大的一步
+5. **核显 offload 没用** —— 显存比模型小，纯属多一层拷贝
+6. **`.env` 必须 CRLF** —— cmd 的 `for /f` 只认 CRLF，LF 存进去整份配置失效
+7. **线程数写 8，不是 12** —— 物理核数，不是逻辑核数
+8. **投机解码默认关** —— 开放任务 -10%，只有改写类 +16%，草稿模型已删
+9. **reasoning 模型别设 stop 词** —— stop 会命中思考过程里的代码块，输出全废
+
+---
+
+## 硬件换算：你的机器能跑多快
+
+不用试，可以估。
+
+```
+生成速度(tok/s) ≈ 有效内存带宽 ÷ 每 token 需读的权重体积
+每 token 体积  ≈ 激活参数量 × 量化字节数（Q4_K_M ≈ 0.55 字节/参数）
+```
+
+验证一下：3B 激活 × 0.55 ≈ 1.65GB；本机有效带宽约 27GB/s（DDR4-3200 双通道理论峰值 53%）→ 估算 16.4 tok/s，实测 13.67 tok/s。差值是调度与 KV 开销，公式够用。
+
+内存需求 ≈ 总参数 × 0.55 + KV 缓存(q8) + 1~2GB 开销。30B × 0.55 = 16.5GB + 1.5GB ≈ 18.5GB，与实测一致。
+
+**结论**：CPU 方案已经接近物理极限（带宽利用率 53%）。想要质变，只能上独显或云 GPU——**这不是调参能解决的**。
+
+---
 
 ## 目录结构
 
 ```
 C:\OfflineAI\
-├── switch-model.bat    # 一键启动（唯一入口）
-├── .env                # 所有可调参数（端口/路径/模型/推理参数/日志）
-├── README.md           # 本文件（定版汇总：数据 + 红线 + 复测方法）
-├── main\               # 运行主体
-│   ├── ikllama\        # 引擎（llama-server.exe 及全部二进制）
-│   ├── models\         # GGUF 模型权重（~26.5GB：Coder-30B + Ling-mini-2.0）
-│   ├── slots\          # KV 缓存槽（重启后首轮热启动）
-│   └── log_filter.py   # 控制台日志美化器（中文提示）
-└── logs\               # 日志落盘（美化日志按天分文件）
+├── switch-model.bat        # 唯一入口：选 1 或 2，一键启动
+├── .env                    # 所有可调参数（端口/路径/模型/推理参数/日志）
+├── README.md               # 你在看的这份
+├── docs\
+│   ├── benchmarks.md       # 完整实测数据、决策红线、复测方法
+│   └── screenshots\
+├── main\
+│   ├── ikllama\            # 引擎（llama-server.exe 及全部工具，147MB）
+│   ├── models\             # GGUF 权重（29GB，不入库）
+│   ├── slots\              # KV 缓存槽（重启热启动）
+│   └── log_filter.py       # 控制台日志美化器（中文提示 + 按天落盘）
+└── logs\                   # llama-YYYY-MM-DD.log，按天滚动，5MB 自动分卷
 ```
 
-## 快速开始
+---
 
-1. 关浏览器（省内存），运行 `switch-model.bat`：
-   - 按 **1** = Coder（Qwen3-Coder-30B-A3B Q4_K_M）→ 写/改代码、tool-calling、Agent
-   - 按 **2** = Office（Ling-mini-2.0 Q4_K_M，纯文本）→ 读长文、问答、总结、改写
-2. 等控制台出现绿色提示 **"[就绪] 模型加载完成，现在可以使用了!"**
-3. 对接地址（OpenAI 兼容）：`http://127.0.0.1:9527/v1/chat/completions`
-   - 浏览器状态页：`http://127.0.0.1:9527`
-   - 端口固定 9527；bat 启动前先杀 llama-server 并清空占用该端口的进程，端口被占则自动等待/中止
-   - 已开 `--jinja`，支持 `tools` 参数（agent 模式可用）
+## 常见问题
 
-## 改配置
+**Q：为什么不直接在网页版用？**
+A：能问的问题不一样。带客户信息的日志、没发布的合同、公司内部代码——这些不该上传到别人的服务器。这里的边界是「物理上出不去」。
 
-**所有需要改的参数都在根目录 `.env`，不要改代码里的硬编码值。** `switch-model.bat` 和 `main/log_filter.py` 都读这一个文件。
+**Q：13 tok/s 是不是太慢了？**
+A：慢，但够用。生成 300 token（约 200 个汉字）要 22 秒左右，读起来反而不觉得卡。真正的时间成本在首轮 prefill（12K 上下文要 2~8 分钟），所以用法是「一次扔个大任务，走开干别的」，不是「一问一答盯着看」。
 
-| 想改什么 | 改哪个键 |
-|---|---|
-| 端口 / 监听地址 | `PORT` `HOST` |
-| 装到别的盘、别的目录 | `SERVER_DIR` `MODELS_DIR` `SLOTS_DIR` `LOGS_DIR` `LOG_FILTER` `PYTHON` |
-| 换模型 | `MODEL_CODER` `MODEL_OFFICE` `MMPROJ_OFFICE`（只写文件名） |
-| 上下文 / 线程 / batch / KV 量化 | `CTX_SIZE` `THREADS` `BATCH` `UBATCH` `CACHE_TYPE_K` `CACHE_TYPE_V` `CRAM` |
-| 日志 | `LOG_PREFIX` `LOG_MAX_MB` |
-| 清端口等待秒数 | `PORT_WAIT_SEC` |
+**Q：为什么不量化到 Q3 换速度？**
+A：实测过，质量下降不值那点速度。宁可缩小模型（30B → 16B MoE），也不降低量化精度。
 
-写法：每个键的上一行有一句注释说明用途；每行 `KEY=VALUE`，注释以 `#` 开头（只能整行）。值不加引号、行尾不留空格、键名前不留空格。**换行必须 Windows(CRLF)、编码 UTF-8 无 BOM** —— cmd 的 `for /f` 只认 CRLF，存成 LF 会让整份配置读不进来（`.gitattributes` 已把 `.env`/`*.bat` 钉成 CRLF）。环境变量同名时优先于 `.env`（`LOG_FILTER_DIR` 可单独覆盖日志落盘目录，测试用）。
-配错不会静默失败：启动前会体检 `PYTHON`、引擎、美化器、所选模型文件，缺哪个直接报 `[error]` 并停住等按键；多个键一起报缺失时会提示换行格式问题。
+**Q：能跑视觉模型吗？**
+A：放弃了。核显显存不够，也没有合适的多模态 GGUF。真需要看图，用云端。
 
-## 选型速查
+**Q：为什么不打包成 Docker / 跨平台？**
+A：这套方案的性能全部来自「贴着这台机器调」——`znver2-avx2` 构建、线程绑物理核、KV 量化组合。抽象一层就丢掉 20~30%。要的是能用的极致，不是能移植的通用。
 
-| 场景 | 模型 | 原因 |
-|---|---|---|
-| 写/改代码、补全、Agent | Coder（按 1） | 无思考税，编程正确率 5/6 |
-| 读长文档、问答、总结、改写 | Office（按 2 = Ling-mini-2.0） | 比 Coder 快 2.3~3.6x、无思考税；纯文本无视觉 |
+---
 
-- 上下文 16K 配置 / **12K 实用**（15K 会崩速卡死）；上下文预计 > 4K 的纯文本任务优先 Office，长 prompt 先估算 token 数
-- 任务复杂度（简单/中等/复杂）对 TG 无实质影响（±5% 内噪声）——选模型只看上下文长度和任务类型，不看难度
-- 投机解码默认关（开放任务 -10%）
+## 更多
 
-## 机器与硬红线
+- **完整实测数据、决策红线、换模型复测方法（3×3 方法 + 脚本）** → [`docs/benchmarks.md`](docs/benchmarks.md)
+- **仓库维护约定** → [`AGENTS.md`](AGENTS.md)
 
-- HP 战66 四代 / Ryzen 7 5800U 8C16T / 2×16GB DDR4-3200 / Vega 8 核显 496MB（无独显）/ 512GB NVMe / Win11
-- **内存总占用 ≤ 26GB**，跑模型前关浏览器（超了会 swap，速度 14→1~3 tok/s）
-- **满上下文守 12K**（15K 触发内存页回收，崩速卡死）
-- 有效带宽 ~27GB/s ≈ DDR4-3200 双通道理论峰值 53%——CPU 方案已近物理极限，质变需 NVIDIA 独显或云 GPU
+## 许可
 
-## 实测数据
+代码 MIT。两个模型各有自己的许可：Qwen3-Coder 为 Apache-2.0，Ling-mini-2.0 为 MIT。
 
-### 引擎
-
-ik_llama build 5481（znver2-avx2）vs 官方 llama.cpp：冷 PP **3.4x**、TG@4K **2.1x**、短 TG +16%。官方版已弃用；ik 参数语法 `-ctk/-ctv`，无 `--swa-full`/`--cache-reuse`。
-
-### 缓存
-
-- prompt 缓存命中：二次请求 19s → 73ms（`prompt_n=1`）
-- slot 存盘：4K save 111ms / 205MB，restore 55ms，重启后第一轮即热
-- ⚠️ prompt 缓存按 **4096 token 分段**复用：13K 上下文每请求重算 ~9K——agent 多轮长上下文每轮 prefill 5~6 分钟，**当前最大痛点**，靠上下文控制缓解
-
-### 3×3 速度矩阵（TG tok/s；测法见「换模型复测」）
-
-| 上文档位 | Coder TG | Ling-mini TG | Coder PP(冷) | Ling-mini PP(冷) |
-|---|---|---|---|---|
-| short ~1.5-3K | 13.67 | 29.7~33.8 | 68.5 | 148~171 |
-| mid ~8K | 7.51 | 26.3~27.0 | 25.8 | 117~119 |
-| full ~12K | 6.83 | 22.8 | 26.1 | 97~98 |
-
-- Ling-mini 快 **2.3~3.6x（TG）/ 3.7x（PP）**；12K 冷 prefill 从 8.4 分钟降到 ~2 分钟
-- 衰减：Ling-mini **-32%** vs Coder **-50%**；内存 ~10.5GB vs 18.5GB
-- 调参结论：T8/b2048/ub512（= 现行 .env）即最优，ub256/T6/T10/b4096ub1024 全部更差
-
-### 编程/Agent 质量（temp=0、pass@1、6 题自动判分）
-
-| | Coder | Ling-mini |
-|---|---|---|
-| 正确率 | **5/6** | **2/6** |
-| tool-calling 两轮闭环 | PASS | PASS |
-
-Ling-mini 四个 FAIL：`+86` 前缀丢首位、正则方括号转义写成 `$$`、`nonlocal` 作用域错、合并只 append 不替换。结论：**Ling-mini 只配纯文本；写代码/Agent 一律 Coder**。
-
-### 元数据
-
-- 估 token 防超限：办公类 ≈ 字符/1.9，Coder 类 ≈ 字符/4；超 16K 直接报错
-- Ling-mini 下载走 ModelScope（稳定 9MB/s；hf-mirror 波动 0.3MB/s），bartowski 仓库文件名带 `inclusionAI_` 前缀
-- 单次生成上限 ~600~1100 token（`n_predict=2000` 不生效），长代码任务拆多轮
-
-## 决策红线（当前生效）
-
-**引擎与参数**
-
-- 引擎 ik_llama（官方弃用）；启动参数 `--ctx-size 16384 -ctk q8_0 -ctv q8_0 -cram 2048 --jinja --slot-save-path C:\OfflineAI\main\slots`
-- **`--jinja` 不能省**——缺了带 `tools` 的请求直接 HTTP 500
-- 8 物理线程（写 12 超线程负优化）；投机解码默认关（仅改写类 +16%；草稿模型已删，启用时重新下载 Qwen3-0.6B 并加 `--spec-type draft-simple`）
-- reasoning 模型不设 stop 词（stop 会命中思考内部的代码块，输出全废）
-
-**运维**
-
-- 目录：引擎 `main/ikllama/`、模型 `main/models/`、槽 `main/slots/`
-- Defender 已对引擎/模型目录加排除（实时扫描会造成卡顿）
-- 后台服务用持久后台任务起，别用 shell `&` 挂（随会话回收）；taskkill 杀 llama-server 会波及同 shell 任务，属预期；脚本临时文件用 `C:/OfflineAI/.xxx`，别用 `/tmp`（Windows Python 看不到 Git Bash 的 /tmp）；GitHub 直连 502，走镜像前缀
-
-**选型**
-
-- 写/改代码、补全、Agent → Coder（按 1）；读长文、问答、总结、改写 → Ling-mini（按 2）
-- 视觉能力已放弃（核显 offload 不可行 + 无多模态模型）
-
-**不要再试（已实测排除）**
-
-- Vega 8 核显 offload（显存 < 模型，无带宽增益）；官方 llama.cpp；ngram 投机（34% 接受率低于红线）；草稿模型投机跑开放任务（-10%）；草稿深度 8（验证开销反噬）；12 线程；dense 大模型（每 token 读全权重，慢 1.4~3.3x）；Q4→Q3 降量化（质量降不值）；`--mlock`（构建不支持）；页面文件调优（瓶颈是带宽不是缺页）
-- 已淘汰：办公-35B（思考税 token 2.43x/耗时 2.15x，长上下文位已被 Ling-mini 接管）；Qwen3.5-9B 密集（全面慢，优势仅内存 7GB）；Aider 本地 agent（本地 PP 太低，注入压到 1.6K 首轮 ~1 分钟是可用边界）
-
-## 换模型复测（3×3 方法）
-
-**是什么**：三档上下文（short ~1.5K / mid ~8K / full ~12K）× 三档任务（简单/中等/复杂）。每格两轮：R1 冷启动（计 PP 冷 + TG）、R2 同 prompt 重发（缓存命中，纯 TG）。满档定 12K 不是 15K；素材用**真实记忆层内容**（AGENTS.md + README + 一段代码），不用编造文本——测的是挂记忆后的真实形态。
-
-**纪律**：关浏览器、内存 ≤26GB；每档 3 任务取均值；统一 `n_predict=300 / temp=0 / top_k=1`；对比只看相对值。
-
-**判读**（基线见「实测数据」）：TG full ≥ 6.83 → 长上下文速度合格；衰减 3K→12K 超 -50% → 只配短上下文；替换 Coder 需补 6 题判分 ≥ 5/6 + tool-calling PASS；替换 Ling-mini 门槛为速度快 + 无思考税；内存峰值 > 18.5GB 基本无缘；12K 冷 prefill ≈ 12000÷PP，> 5 分钟则长文场景不可用。
-
-**步骤**：GGUF 放 `main/models/` → `.env` 的 `MODEL_OFFICE` 指向它 → `switch-model.bat` 启动 → 跑下面的 `bench_3x3.py`（存为 `main/bench_3x3.py`）→ 数据写回本文「实测数据」。
-
-```python
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""bench_3x3.py - 3x3 速度矩阵：三档上下文 x 三档任务 x (R1 冷启动 + R2 缓存命中)
-用法: python main\bench_3x3.py [--filler x.md] [--cpt 1.9]   # 在 C:\OfflineAI 下运行
-"""
-import argparse, glob, json, os, urllib.request
-
-DEFAULT_URL = "http://127.0.0.1:9527/v1/completions"
-N_PREDICT = 300
-TIERS = [("short", 1500), ("mid", 8000), ("full", 12000)]
-TASKS = ["simple", "medium", "complex"]
-QUESTIONS = {
-    "simple":  "用一句话概括下面资料的主题。",
-    "medium":  "列出资料中提到的三个关键约束，各用一句话说明理由。",
-    "complex": "假设要按这份资料在本机搭建一套本地推理环境，写出分步计划，并指出每步最容易踩的坑。",
-}
-
-def load_filler(path):
-    if path:
-        with open(path, encoding="utf-8") as f:
-            return f.read()
-    parts = []
-    for p in ["AGENTS.md", "README.md"] + sorted(glob.glob("*.md")):
-        if os.path.exists(p):
-            with open(p, encoding="utf-8") as f:
-                parts.append(f.read())
-    return "\n\n".join(parts)
-
-def complete(opener, url, prompt):
-    body = json.dumps({
-        "prompt": prompt, "n_predict": N_PREDICT,
-        "temperature": 0.0, "top_k": 1, "cache_prompt": True,
-    }).encode()
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-    with opener.open(req, timeout=7200) as r:
-        d = json.load(r)
-    t = d.get("timings", {})
-    return t.get("prompt_n", 0), t.get("prompt_per_second", 0.0), t.get("predicted_per_second", 0.0)
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--url", default=DEFAULT_URL)
-    ap.add_argument("--filler", default=None, help="上下文填充素材（默认 AGENTS.md + README）")
-    ap.add_argument("--cpt", type=float, default=4.0, help="字符/token 估算比：Coder 类 ~4，办公类 ~1.9")
-    a = ap.parse_args()
-    filler = load_filler(a.filler)
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 绕过本机 HTTP_PROXY
-
-    print("| 上文档位 | 任务 | prompt_n | PP(冷) | TG R1 | TG R2(缓存命中) |")
-    print("|---|---|---|---|---|---|")
-    for tier, tok in TIERS:
-        ctx = filler[: int(tok * a.cpt)]
-        for task in TASKS:
-            prompt = QUESTIONS[task] + "\n\n资料如下：\n" + ctx
-            pn, pp, tg1 = complete(opener, a.url, prompt)   # R1 冷启动：计量 PP
-            _, _, tg2 = complete(opener, a.url, prompt)     # R2 同 prompt：缓存命中，纯 TG
-            print(f"| {tier} ~{tok // 1000}K | {task} | {pn} | {pp:.1f} | {tg1:.2f} | {tg2:.2f} |")
-
-if __name__ == "__main__":
-    main()
-```
-
-**要点**：`cache_prompt=True` 两轮都传——R1 是该 prompt 首次出现仍是全额 prefill（真冷数据），R2 命中缓存；`--cpt` 按 tokenizer 效率调（Coder 类 ~4、办公类 ~1.9），不调 12K 档会灌进 24K token 直接报错；换模型重启后第一遍是冷数据。
-
-**常见异常**：R2 没命中（prompt_n 仍≈全量）→ 用 R1 的 TG（实测两轮一致）；连本机 502/代理错 → 脚本已绕过代理，用别的客户端设 `NO_PROXY=127.0.0.1,localhost`；速度骤降 → 内存在 swap，关浏览器重测。
-
-## 日志说明
-
-- **控制台**：经 `main/log_filter.py` 美化，格式 `[时间] [标签] 中文消息`
-  - `[提示]` 启动四步走（读模型→载内存→预热→就绪）
-  - `[就绪]` 加载完成 + 对接地址
-  - `[API]` / `[Perf]` / `[缓存]` 每次请求结果与耗时
-  - `[错误]` HTTP 4xx/5xx 及 error/failed 行，排查先看这里
-- **落盘（`logs/`）**：
-  - `llama-YYYY-MM-DD.log` — `log_filter.py` 美化后的日志，内容与控制台一致
-    - 每天一个新文件；单个文件写满 **5MB** 自动新开 `llama-YYYY-MM-DD_1.log`、`_2.log`…
-    - 同一天重复启动会接着当天最后一个没写满的文件追加，不覆盖
-    - 进程一直跑过午夜会自动切到新一天的文件
-
-## 维护纪律
-
-1. 动 bat / 启动参数前先读本文「决策红线」和「实测数据」
-2. 只有实测结论能写进本文档；矛盾时以实测为准并同步更新
-3. 任务收尾把新决策/新坑 write-back 到本 README
-4. 引擎二进制不要删（`main/ikllama/` 里的 bench/cli 等工具各有用处）
-5. 文档只留当前生效的结论；调试/迭代过程（v2/v3 演进、脚本复现步骤）不写入
+<div align="center">
+<sub>如果你也在没有显卡的机器上折腾本地模型，欢迎开 issue 报一下你的实测数字。</sub>
+</div>
